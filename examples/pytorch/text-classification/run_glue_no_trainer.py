@@ -46,6 +46,10 @@ from transformers import (
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
+from transformers.integrations import HfDeepSpeedConfig
+import deepspeed
+import intel_extension_for_pytorch
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.35.0.dev0")
@@ -66,6 +70,14 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 }
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # To avoid warnings about parallelism in tokenizers
+
+# distributed setup
+local_rank = int(os.getenv("LOCAL_RANK", "0"))
+world_size = int(os.getenv("WORLD_SIZE", "1"))
+torch.xpu.set_device(local_rank)
+deepspeed.init_distributed()
+device = 'xpu:' + str(local_rank)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
@@ -198,6 +210,8 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument("--local_rank", type=int, default=0, help="Local rank id.")
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -335,6 +349,11 @@ def main():
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         trust_remote_code=args.trust_remote_code,
     )
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = config.eos_token_id
+    # model.config.pad_token_id = 2
 
     # Preprocessing the datasets
     if args.task_name is not None:
@@ -458,11 +477,76 @@ def main():
         num_warmup_steps=args.num_warmup_steps,
         num_training_steps=args.max_train_steps,
     )
+    #Lora
+    from peft import LoraConfig, get_peft_model
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        # target_modules=["query", "value"],
+        lora_dropout=0.1,
+        bias="none",
+        modules_to_save=["classifier"],
     )
+    lora_model = get_peft_model(model, lora_config)
+    # print_trainable_parameters(lora_model)
+    model = lora_model
+
+
+
+    # Deepspeed
+    model_hidden_size = config.hidden_size
+    # batch size has to be divisible by world_size, but can be bigger than world_size
+    train_batch_size = 1 * world_size
+    ds_config = {
+        "fp16": {
+            "enabled": False
+        },
+        "bf16": {
+            "enabled": True
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": model_hidden_size * model_hidden_size,
+            "stage3_prefetch_bucket_size": 0.9 * model_hidden_size * model_hidden_size,
+            "stage3_param_persistence_threshold": 10 * model_hidden_size
+        },
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "checkpoint_in_cpu":True
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+            "lr": 0.00015,
+            "torch_adam":True
+            }
+        },
+        "steps_per_print": 2000,
+        "train_batch_size": train_batch_size,
+        "train_micro_batch_size_per_gpu": 1,
+        "wall_clock_breakdown": False,
+        "communication_data_type": "bfp16"
+    }
+    dschf = HfDeepSpeedConfig(ds_config)  # keep this object alive
+    ds_engine, optimizer, _, lr_scheduler = deepspeed.initialize(model=model, config_params=ds_config)
+    # ds_engine.module.train()
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        text_in = "Is this review positive or negative? Review: this is the best cast iron skillet you will ever buy"
+    elif rank == 11:
+        text_in = "Is this review positive or negative? Review: this is the worst restaurant ever"
+
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -546,17 +630,21 @@ def main():
         else:
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
-            outputs = model(**batch)
+            # outputs = model(**batch)
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = ds_engine.module(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
             if args.with_tracking:
                 total_loss += loss.detach().float()
             loss = loss / args.gradient_accumulation_steps
-            accelerator.backward(loss)
+            # accelerator.backward(loss)
+            ds_engine.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                # optimizer.step()
+                # lr_scheduler.step()
+                # optimizer.zero_grad()
+                ds_engine.step()
                 progress_bar.update(1)
                 completed_steps += 1
 
@@ -574,7 +662,8 @@ def main():
         samples_seen = 0
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                outputs = model(**batch)
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = ds_engine.module(**batch)
             predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
             predictions, references = accelerator.gather((predictions, batch["labels"]))
             # If we are in a multiprocess environment, the last batch has duplicates
@@ -663,3 +752,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print("actually all done", flush=True)
