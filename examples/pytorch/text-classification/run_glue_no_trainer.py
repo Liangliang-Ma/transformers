@@ -49,6 +49,7 @@ from transformers.utils.versions import require_version
 from transformers.integrations import HfDeepSpeedConfig
 import deepspeed
 import intel_extension_for_pytorch
+# from transformers import AutoModel, Trainer, TrainingArguments
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -230,9 +231,74 @@ def parse_args():
 
     return args
 
-
 def main():
     args = parse_args()
+
+    model_hidden_size = 8192
+    # batch size has to be divisible by world_size, but can be bigger than world_size
+    train_batch_size = 1 * world_size
+
+    # "offload_optimizer": {
+    #     "device": "nvme",
+    #     "nvme_path": "/home/maliangl/fakenvme",
+    #     "buffer_count": 10
+    #   },
+    #   "offload_param": {
+    #       "device": "nvme",
+    #       "nvme_path": "/home/maliangl/fakenvme",
+    #       "buffer_count": 10
+    #   }
+    # "offload_param": {
+    #             "device": "cpu",
+    #             "pin_memory": True
+    #         },
+    #         "offload_optimizer": {
+    #             "device": "cpu",
+    #             "pin_memory": True
+    #         },
+    ds_config = {
+        "fp16": {
+            "enabled": False
+        },
+        "bf16": {
+            "enabled": True
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": model_hidden_size * model_hidden_size,
+            "stage3_prefetch_bucket_size": 0.9 * model_hidden_size * model_hidden_size,
+            "stage3_param_persistence_threshold": 10 * model_hidden_size
+        },
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "checkpoint_in_cpu":True
+        },
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+            "lr": 0.00015,
+            "torch_adam":True
+            }
+        },
+        "steps_per_print": 2000,
+        "train_batch_size": train_batch_size,
+        "train_micro_batch_size_per_gpu": 1,
+        "wall_clock_breakdown": False,
+        "communication_data_type": "bfp16"
+    }
+    dschf = HfDeepSpeedConfig(ds_config)  # keep this object alive
+
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_no_trainer", args)
@@ -333,27 +399,73 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(
-        args.model_name_or_path,
-        num_labels=num_labels,
-        finetuning_task=args.task_name,
-        trust_remote_code=args.trust_remote_code,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
-    )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
-        config=config,
-        ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        trust_remote_code=args.trust_remote_code,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    model.resize_token_embeddings(len(tokenizer))
-    model.config.pad_token_id = config.eos_token_id
-    # model.config.pad_token_id = 2
+    # training_args = TrainingArguments(deepspeed=ds_config)
+    with deepspeed.zero.Init():
+        config = AutoConfig.from_pretrained(
+            args.model_name_or_path,
+            num_labels=num_labels,
+            finetuning_task=args.task_name,
+            trust_remote_code=args.trust_remote_code,
+        )
+        print("mll:config ok")
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
+        )
+        print("mll:config, tokenizer ok")
+        # import ipdb
+        # ipdb.set_trace()
+
+        # model = AutoModelForSequenceClassification.from_pretrained(
+        #     args.model_name_or_path,
+        #     from_tf=bool(".ckpt" in args.model_name_or_path),
+        #     config=config,
+        #     ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+        #     trust_remote_code=args.trust_remote_code,
+        #     # low_cpu_mem_usage=True
+        # )
+        model = AutoModelForSequenceClassification.from_config(config=config)
+
+        model.gradient_checkpointing_enable() # mll1
+        # model.config.use_cache = False
+
+        print("mll:total num of para:", model.num_parameters(), flush=True)
+
+        print("mll:config, tokenizer, model ok", flush=True)
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        # model.resize_token_embeddings(len(tokenizer))
+        # model.config.pad_token_id = config.eos_token_id
+
+        # Some models have set the order of the labels to use, so let's make sure we do use it.
+        label_to_id = None
+        if (
+            model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+            and args.task_name is not None
+            and not is_regression
+        ):
+            # Some have all caps in their config, some don't.
+            label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
+            if sorted(label_name_to_id.keys()) == sorted(label_list):
+                logger.info(
+                    f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
+                    "Using it!"
+                )
+                label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
+            else:
+                logger.warning(
+                    "Your model seems to have been trained with labels, but they don't match the dataset: ",
+                    f"model labels: {sorted(label_name_to_id.keys())}, dataset labels: {sorted(label_list)}."
+                    "\nIgnoring the model labels as a result.",
+                )
+        elif args.task_name is None and not is_regression:
+            label_to_id = {v: i for i, v in enumerate(label_list)}
+
+        if label_to_id is not None:
+            model.config.label2id = label_to_id
+            model.config.id2label = {id: label for label, id in config.label2id.items()}
+        elif args.task_name is not None and not is_regression:
+            model.config.label2id = {l: i for i, l in enumerate(label_list)}
+            model.config.id2label = {id: label for label, id in config.label2id.items()}
 
     # Preprocessing the datasets
     if args.task_name is not None:
@@ -368,37 +480,6 @@ def main():
                 sentence1_key, sentence2_key = non_label_column_names[:2]
             else:
                 sentence1_key, sentence2_key = non_label_column_names[0], None
-
-    # Some models have set the order of the labels to use, so let's make sure we do use it.
-    label_to_id = None
-    if (
-        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
-        and args.task_name is not None
-        and not is_regression
-    ):
-        # Some have all caps in their config, some don't.
-        label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
-        if sorted(label_name_to_id.keys()) == sorted(label_list):
-            logger.info(
-                f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
-                "Using it!"
-            )
-            label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
-        else:
-            logger.warning(
-                "Your model seems to have been trained with labels, but they don't match the dataset: ",
-                f"model labels: {sorted(label_name_to_id.keys())}, dataset labels: {sorted(label_list)}."
-                "\nIgnoring the model labels as a result.",
-            )
-    elif args.task_name is None and not is_regression:
-        label_to_id = {v: i for i, v in enumerate(label_list)}
-
-    if label_to_id is not None:
-        model.config.label2id = label_to_id
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
-    elif args.task_name is not None and not is_regression:
-        model.config.label2id = {l: i for i, l in enumerate(label_list)}
-        model.config.id2label = {id: label for label, id in config.label2id.items()}
 
     padding = "max_length" if args.pad_to_max_length else False
 
@@ -449,21 +530,6 @@ def main():
     )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
-    no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -471,12 +537,6 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
     #Lora
     from peft import LoraConfig, get_peft_model
 
@@ -495,50 +555,7 @@ def main():
 
 
     # Deepspeed
-    model_hidden_size = config.hidden_size
-    # batch size has to be divisible by world_size, but can be bigger than world_size
-    train_batch_size = 1 * world_size
-    ds_config = {
-        "fp16": {
-            "enabled": False
-        },
-        "bf16": {
-            "enabled": True
-        },
-        "zero_optimization": {
-            "stage": 3,
-            "offload_param": {
-                "device": "cpu",
-                "pin_memory": True
-            },
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": True
-            },
-            "overlap_comm": True,
-            "contiguous_gradients": True,
-            "reduce_bucket_size": model_hidden_size * model_hidden_size,
-            "stage3_prefetch_bucket_size": 0.9 * model_hidden_size * model_hidden_size,
-            "stage3_param_persistence_threshold": 10 * model_hidden_size
-        },
-        "activation_checkpointing": {
-            "partition_activations": True,
-            "checkpoint_in_cpu":True
-        },
-        "optimizer": {
-            "type": "Adam",
-            "params": {
-            "lr": 0.00015,
-            "torch_adam":True
-            }
-        },
-        "steps_per_print": 2000,
-        "train_batch_size": train_batch_size,
-        "train_micro_batch_size_per_gpu": 1,
-        "wall_clock_breakdown": False,
-        "communication_data_type": "bfp16"
-    }
-    dschf = HfDeepSpeedConfig(ds_config)  # keep this object alive
+    
     ds_engine, optimizer, _, lr_scheduler = deepspeed.initialize(model=model, config_params=ds_config)
     # ds_engine.module.train()
     rank = torch.distributed.get_rank()
@@ -620,6 +637,8 @@ def main():
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
+    # import ipdb
+    # ipdb.set_trace()
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:

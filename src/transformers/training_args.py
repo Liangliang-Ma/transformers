@@ -1755,6 +1755,7 @@ class TrainingArguments:
                 )
             AcceleratorState._reset_state(reset_partial_state=True)
         self.distributed_state = None
+        print("setup devices", self._n_gpu, is_torch_xpu_available())
         if not self.use_ipex and "ACCELERATE_USE_IPEX" not in os.environ:
             os.environ["ACCELERATE_USE_IPEX"] = "false"
         if self.use_cpu or strtobool(os.environ.get("ACCELERATE_USE_CPU", "False")):
@@ -1784,6 +1785,7 @@ class TrainingArguments:
                 backend=self.ddp_backend, timeout=timedelta(seconds=self.ddp_timeout)
             )
             self._n_gpu = 1
+        print("setup devices mid", self._n_gpu, is_torch_xpu_available())
         if not is_sagemaker_mp_enabled():
             device = self.distributed_state.device
             self.local_rank = self.distributed_state.local_process_index
@@ -1798,12 +1800,13 @@ class TrainingArguments:
         elif is_sagemaker_dp_enabled() or is_sagemaker_mp_enabled():
             # Already set _n_gpu
             pass
-        elif self.distributed_state.distributed_type == DistributedType.MULTI_XPU:
-            if "ACCELERATE_USE_XPU" not in os.environ:
-                os.environ["ACCELERATE_USE_XPU"] = "true"
-            self._n_gpu = torch.xpu.device_count()
-            device = torch.device("xpu:0")
-            torch.xpu.set_device(device)
+        # elif self.distributed_state.distributed_type == DistributedType.MULTI_XPU:
+        #     if "ACCELERATE_USE_XPU" not in os.environ:
+        #         os.environ["ACCELERATE_USE_XPU"] = "true"
+        #     self._n_gpu = torch.xpu.device_count()
+        #     device = torch.device("xpu:0")
+        #     torch.xpu.set_device(device)
+        #     print("setup devices MULTI_XPU", self._n_gpu, self.distributed_state.distributed_type)
         elif self.distributed_state.distributed_type == DistributedType.NO:
             if self.use_mps_device:
                 warnings.warn(
@@ -1842,6 +1845,7 @@ class TrainingArguments:
                 self._n_gpu = torch.cuda.device_count()
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
+        print("setup devices end", self._n_gpu)
         return device
 
     @property

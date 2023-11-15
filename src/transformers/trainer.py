@@ -1307,7 +1307,11 @@ class Trainer:
 
         # Multi-gpu training (should be after apex fp16 initialization) / 8bit models does not support DDP
         if self.args.n_gpu > 1 and not getattr(model, "is_loaded_in_8bit", False):
+            print("Trainer DP", flush=True)
             model = nn.DataParallel(model)
+        #     model = torch.nn.parallel.DistributedDataParallel(
+        #     model, device_ids=[self.args.local_rank], output_device=self.args.local_rank, find_unused_parameters=True
+        # )
 
         if self.args.jit_mode_eval:
             start_time = time.time()
@@ -1380,6 +1384,7 @@ class Trainer:
 
             xm.optimizer_step = patched_optimizer_step
         elif is_sagemaker_dp_enabled():
+            print("Trainer DDP", flush=True)
             model = nn.parallel.DistributedDataParallel(
                 model, device_ids=[int(os.getenv("SMDATAPARALLEL_LOCAL_RANK"))]
             )
