@@ -265,14 +265,14 @@ def main():
         },
         "zero_optimization": {
             "stage": 3,
-            "offload_param": {
-                "device": "cpu",
-                "pin_memory": True
-            },
-            "offload_optimizer": {
-                "device": "cpu",
-                "pin_memory": True
-            },
+            # "offload_param": {
+            #     "device": "cpu",
+            #     "pin_memory": True
+            # },
+            # "offload_optimizer": {
+            #     "device": "cpu",
+            #     "pin_memory": True
+            # },
             "overlap_comm": True,
             "contiguous_gradients": True,
             "reduce_bucket_size": model_hidden_size * model_hidden_size,
@@ -426,7 +426,7 @@ def main():
         model = AutoModelForSequenceClassification.from_config(config=config)
 
         model.gradient_checkpointing_enable() # mll1
-        # model.config.use_cache = False
+        model.config.use_cache = False
 
         print("mll:total num of para:", model.num_parameters(), flush=True)
 
@@ -539,19 +539,16 @@ def main():
 
     #Lora
     from peft import LoraConfig, get_peft_model
-
     lora_config = LoraConfig(
         r=16,
         lora_alpha=16,
-        # target_modules=["query", "value"],
+        target_modules=["query_key_value"],
         lora_dropout=0.1,
         bias="none",
-        modules_to_save=["classifier"],
     )
     lora_model = get_peft_model(model, lora_config)
-    # print_trainable_parameters(lora_model)
     model = lora_model
-
+    # print_trainable_parameters(lora_model)
 
 
     # Deepspeed
