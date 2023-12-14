@@ -49,7 +49,7 @@ from transformers.utils.versions import require_version
 from transformers.integrations import HfDeepSpeedConfig
 import deepspeed
 from deepspeed.accelerator import get_accelerator
-
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.35.0.dev0")
@@ -75,16 +75,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # To avoid warnings about parall
 # distributed setup
 local_rank = int(os.getenv("LOCAL_RANK", "0"))
 world_size = int(os.getenv("WORLD_SIZE", "1"))
-
-os.environ['CCL_PROCESS_LAUNCHER'] = 'none'
-os.environ['CCL_LOCAL_SIZE'] = str(world_size)
-os.environ['CCL_LOCAL_RANK'] = str(local_rank)
-
 get_accelerator().set_device(local_rank)
 deepspeed.init_distributed()
 device = get_accelerator().current_device_name()
-
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
@@ -246,9 +239,7 @@ def record_current_mem_info(name='', print_mem=False):
             print(s, flush=True)
         # print(get_accelerator().memory_stats())
         # print(torch.xpu.memory_snapshot())
-        for MA in tmp_record_buffer[1:4]:
-            print(MA)
-        for MA in tmp_record_buffer[-3:]:
+        for MA in tmp_record_buffer[1:10]:
             print(MA)
         return
     get_accelerator().empty_cache()
@@ -456,7 +447,7 @@ def main():
         #     trust_remote_code=args.trust_remote_code,
         #     # low_cpu_mem_usage=True
         # )
-        model = AutoModelForSequenceClassification.from_config(config=config)
+        model = AutoModelForSequenceClassification.from_config(config=config, )
 
         model.gradient_checkpointing_enable() # mll1
         model.config.use_cache = False
@@ -630,6 +621,13 @@ def main():
 
     # import ipdb
     # ipdb.set_trace()
+
+    def trace_handler(p):
+        if local_rank == 0:
+            output = p.key_averages().table(sort_by="self_cuda_time_total")
+            print(output)
+        #p.export_chrome_trace("trace_a100.json")
+        
     record_current_mem_info("ds init     ")
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
@@ -637,134 +635,40 @@ def main():
         for step, batch in enumerate(active_dataloader):
             # outputs = model(**batch)
             batch = {k: v.to(device) for k, v in batch.items()}
-            # with torch.autograd.profiler_legacy.profile(
-            #     enabled=True, 
-            #     use_xpu=True,
-            #     # schedule=torch.profiler.schedule(
-            #     #     skip_first=10,
-            #     #     wait=5,
-            #     #     warmup=1,
-            #     #     active=3)
-            #     ) as prof:
-            #     with torch.profiler.record_function("Llama_training"):
-            outputs = ds_engine.module(**batch)
-            record_current_mem_info("after fwd  " + str(step))
-            loss = outputs.loss
-            loss = loss / args.gradient_accumulation_steps
-            # print("my loss:", loss)
-            # accelerator.backward(loss)
-            ds_engine.backward(loss)
-            record_current_mem_info("after bwd  " + str(step))
-            if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                ds_engine.step()
-                progress_bar.update(1)
-                completed_steps += 1
-            record_current_mem_info("after iter " + str(step))
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                # schedule=torch.profiler.schedule(
+                #     wait=5,
+                #     warmup=1,
+                #     active=2),
+                on_trace_ready=trace_handler
+            ) as p:
+                outputs = ds_engine.module(**batch)
+                record_current_mem_info("after fwd  " + str(step))
+                loss = outputs.loss
+                loss = loss / args.gradient_accumulation_steps
+                # accelerator.backward(loss)
+                ds_engine.backward(loss)
+                record_current_mem_info("after bwd  " + str(step))
+                if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+                    ds_engine.step()
+                    progress_bar.update(1)
+                    completed_steps += 1
+                record_current_mem_info("after iter " + str(step))
+
+                p.step()
 
             if completed_steps >= args.max_train_steps:
                 import deepspeed.comm as dist
                 dist.log_summary()  
+                #    output = p.key_averages().table(sort_by="self_cuda_time_total")
+                 #   print(output)
                 if local_rank == 0:
-                    # print(prof.key_averages().table(
-                    #             sort_by=f"self_{get_accelerator().device_name()}_time_total",
-                    #             row_limit=-1))
                     record_current_mem_info(print_mem=True)
-                    # prof.export_chrome_trace("llama_trace.json")
-            
-                break
-
-    #     model.eval()
-    #     samples_seen = 0
-    #     for step, batch in enumerate(eval_dataloader):
-    #         with torch.no_grad():
-    #             batch = {k: v.to(device) for k, v in batch.items()}
-    #             outputs = ds_engine.module(**batch)
-    #         predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-    #         predictions, references = accelerator.gather((predictions, batch["labels"]))
-    #         # If we are in a multiprocess environment, the last batch has duplicates
-    #         if accelerator.num_processes > 1:
-    #             if step == len(eval_dataloader) - 1:
-    #                 predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-    #                 references = references[: len(eval_dataloader.dataset) - samples_seen]
-    #             else:
-    #                 samples_seen += references.shape[0]
-    #         metric.add_batch(
-    #             predictions=predictions,
-    #             references=references,
-    #         )
-
-    #     eval_metric = metric.compute()
-    #     logger.info(f"epoch {epoch}: {eval_metric}")
-
-    #     # if args.with_tracking:
-    #     accelerator.log(
-    #         {
-    #             "accuracy" if args.task_name is not None else "glue": eval_metric,
-    #             "train_loss": total_loss.item() / len(train_dataloader),
-    #             "epoch": epoch,
-    #             "step": completed_steps,
-    #         },
-    #         step=completed_steps,
-    #     )
-
-    #     if args.push_to_hub and epoch < args.num_train_epochs - 1:
-    #         accelerator.wait_for_everyone()
-    #         unwrapped_model = accelerator.unwrap_model(model)
-    #         unwrapped_model.save_pretrained(
-    #             args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-    #         )
-    #         if accelerator.is_main_process:
-    #             tokenizer.save_pretrained(args.output_dir)
-    #             repo.push_to_hub(
-    #                 commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
-    #             )
-
-    #     if args.checkpointing_steps == "epoch":
-    #         output_dir = f"epoch_{epoch}"
-    #         if args.output_dir is not None:
-    #             output_dir = os.path.join(args.output_dir, output_dir)
-    #         accelerator.save_state(output_dir)
-
-    # if args.with_tracking:
-    #     accelerator.end_training()
-
-    # if args.output_dir is not None:
-    #     accelerator.wait_for_everyone()
-    #     unwrapped_model = accelerator.unwrap_model(model)
-    #     unwrapped_model.save_pretrained(
-    #         args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-    #     )
-    #     if accelerator.is_main_process:
-    #         tokenizer.save_pretrained(args.output_dir)
-    #         if args.push_to_hub:
-    #             repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
-    # if args.task_name == "mnli":
-    #     # Final evaluation on mismatched validation set
-    #     eval_dataset = processed_datasets["validation_mismatched"]
-    #     eval_dataloader = DataLoader(
-    #         eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-    #     )
-    #     eval_dataloader = accelerator.prepare(eval_dataloader)
-
-    #     model.eval()
-    #     for step, batch in enumerate(eval_dataloader):
-    #         outputs = model(**batch)
-    #         predictions = outputs.logits.argmax(dim=-1)
-    #         metric.add_batch(
-    #             predictions=accelerator.gather(predictions),
-    #             references=accelerator.gather(batch["labels"]),
-    #         )
-
-    #     eval_metric = metric.compute()
-    #     logger.info(f"mnli-mm: {eval_metric}")
-
-    # if args.output_dir is not None:
-    #     all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
-    #     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-    #         json.dump(all_results, f)
-
+                    p.export_chrome_trace("trace_a100.json")
+                    break
 
 if __name__ == "__main__":
     main()
     print("actually all done", flush=True)
+
