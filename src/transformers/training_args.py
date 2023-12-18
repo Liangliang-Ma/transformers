@@ -1845,9 +1845,12 @@ class TrainingArguments:
         self.distributed_state = None
         if not self.use_ipex and "ACCELERATE_USE_IPEX" not in os.environ:
             os.environ["ACCELERATE_USE_IPEX"] = "false"
-        if self.use_cpu or strtobool(os.environ.get("ACCELERATE_USE_CPU", "False")):
-            self.distributed_state = PartialState(cpu=True, backend=self.ddp_backend)
-            self._n_gpu = 0
+        if self.deepspeed:
+            # Need to do similar for Accelerator init
+            os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
+            self.distributed_state = PartialState(timeout=timedelta(seconds=self.ddp_timeout))
+            del os.environ["ACCELERATE_USE_DEEPSPEED"]
+            self._n_gpu = 1
         elif is_sagemaker_mp_enabled():
             local_rank = smp.local_rank()
             device = torch.device("cuda", local_rank)
@@ -1861,12 +1864,9 @@ class TrainingArguments:
         elif is_sagemaker_dp_enabled():
             self.distributed_state = PartialState(_use_sagemaker_dp=True)
             self._n_gpu = 1
-        elif self.deepspeed:
-            # Need to do similar for Accelerator init
-            os.environ["ACCELERATE_USE_DEEPSPEED"] = "true"
-            self.distributed_state = PartialState(timeout=timedelta(seconds=self.ddp_timeout))
-            del os.environ["ACCELERATE_USE_DEEPSPEED"]
-            self._n_gpu = 1
+        elif self.use_cpu or strtobool(os.environ.get("ACCELERATE_USE_CPU", "False")):
+            self.distributed_state = PartialState(cpu=True, backend=self.ddp_backend)
+            self._n_gpu = 0
         else:
             self.distributed_state = PartialState(
                 backend=self.ddp_backend, timeout=timedelta(seconds=self.ddp_timeout)
