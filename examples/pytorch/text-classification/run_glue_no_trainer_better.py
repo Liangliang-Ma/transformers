@@ -450,16 +450,20 @@ def main():
 
         # model = AutoModelForSequenceClassification.from_pretrained(
         #     args.model_name_or_path,
-        #     from_tf=bool(".ckpt" in args.model_name_or_path),
-        #     config=config,
-        #     ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        #     trust_remote_code=args.trust_remote_code,
+        #     # torch_dtype=torch.bfloat16
         #     # low_cpu_mem_usage=True
         # )
         model = AutoModelForSequenceClassification.from_config(config=config)
 
         model.gradient_checkpointing_enable() # mll1
         model.config.use_cache = False
+        model.config._attn_implementation = "sdpa"
+        
+        print(model.config._attn_implementation, "attentttntntntntn")
+
+        # from optimum.bettertransformer import BetterTransformer
+        # model = BetterTransformer.transform(model)
+        # model.to_bettertransformer()
 
         print("mll:total num of para:", model.num_parameters(), flush=True)
 
@@ -640,7 +644,7 @@ def main():
             with torch.autograd.profiler_legacy.profile(
                 enabled=True, 
                 use_xpu=True,
-                record_shapes=True,
+                # record_shapes=True,
                 # schedule=torch.profiler.schedule(
                 #     skip_first=10,
                 #     wait=5,
@@ -652,8 +656,6 @@ def main():
                     record_current_mem_info("after fwd  " + str(step))
                     loss = outputs.loss
                     loss = loss / args.gradient_accumulation_steps
-                    # print("my loss:", loss)
-                    # accelerator.backward(loss)
                     ds_engine.backward(loss)
                     record_current_mem_info("after bwd  " + str(step))
                     if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
